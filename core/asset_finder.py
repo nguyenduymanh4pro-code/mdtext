@@ -1,20 +1,33 @@
 """
-Faster asset finder that leverages step_1_config.txt (if present) to avoid brute-force.
+Faster asset finder that leverages a built-in mapping of expected
+asset filenames (hex names) to avoid brute-force scanning.
 
-This module provides:
-- load_search_triples_from_config(config_path) -> list[(search_term, expected_filename, expected_size)]
-- named_search / size_search / brute_force_search (same semantics)
-- search(...) (tries smart methods then brute force)
-- multi_search(path_0000, search_terms, expected_info=None, logger=print)
+Behavior:
+- If a step_1_config.txt exists next to the project root it is still used.
+- Otherwise a built-in default list (from your message) is used so the tool
+  will try a direct named lookup at 0000/<first2>/<expected_filename> for each asset.
+- Falls back to size-based search or brute force only if direct lookup fails.
 
-If expected_info is omitted, multi_search will attempt to read the repository's
-step_1_config.txt (project root) to obtain expected filenames and sizes so it can
-do a much faster direct lookup (direct path / size-based) instead of full brute force.
+This makes searching many orders of magnitude faster in typical Master Duel installs.
 """
 from pathlib import Path
 import UnityPy
 import os
 from typing import List, Optional, Tuple
+
+# Default triples taken from your message: (search_term, expected_filename, expected_size)
+# expected_size set to 0 when unknown: named_search uses expected_filename only.
+DEFAULT_SEARCH_TRIPLES: List[Tuple[str, str, int]] = [
+    ("CARD_Desc", "21ae1efa", 0),
+    ("CARD_Indx", "507764bc", 0),
+    ("CARD_Name", "7438cca8", 0),
+    ("Card_Part", "52739c94", 0),
+    ("Card_Pidx", "494e34d0", 0),
+    ("CARD_Prop", "85757744", 0),
+    ("WORD_Text", "f5361426", 0),
+    ("WORD_Indx", "b4d165f3", 0),
+    ("CardPictureFontSetting", "fcd008c9", 0),
+]
 
 def is_correct_file(path, obj, search_term):
     try:
@@ -25,10 +38,10 @@ def is_correct_file(path, obj, search_term):
 
 def named_search(path_0000: Path, search_term: str, expected_filename: str) -> Optional[dict]:
     """
-    If we know the expected filename (the hex filename stored in 0000/<first2>/<filename>),
-    go directly to that path and check whether its contained Unity objects include the
-    requested m_Name. This is very fast compared to brute force.
+    Direct lookup to 0000/<first2>/<expected_filename> which is much faster than scanning.
     """
+    if not expected_filename:
+        return None
     expected_file_path = Path(path_0000) / expected_filename[:2] / expected_filename
     if expected_file_path.is_file():
         try:
@@ -41,10 +54,6 @@ def named_search(path_0000: Path, search_term: str, expected_filename: str) -> O
     return None
 
 def size_search(path_0000: Path, search_term: str, expected_size: int) -> Optional[dict]:
-    """
-    Search files in path_0000 sorted by closeness to expected_size. This reduces the
-    number of UnityPy loads for large collections.
-    """
     files_list = []
     for root, dirs, files in os.walk(path_0000):
         for fn in files:
@@ -65,9 +74,6 @@ def size_search(path_0000: Path, search_term: str, expected_size: int) -> Option
     return None
 
 def brute_force_search(path_0000: Path, search_term: str) -> Optional[dict]:
-    """
-    Full scan. Slow; fallback only.
-    """
     for root, dirs, files in os.walk(path_0000):
         for fn in files:
             fp = Path(root) / fn
@@ -88,76 +94,28 @@ def search(path_0000: Path, search_term: str, expected_filename: str, expected_s
     if expected_filename:
         res = named_search(path_0000, search_term, expected_filename)
         if res:
-            logger(f"Found {search_term} by named_search.")
+            logger(f"Found {search_term} by named_search -> {res['path']}")
             return res
-    # try size-based search if expected_size provided
+    # try size-based search if expected_size provided and > 0
     if expected_size:
         res = size_search(path_0000, search_term, expected_size)
         if res:
-            logger(f"Found {search_term} by size_search.")
+            logger(f"Found {search_term} by size_search -> {res['path']}")
             return res
     logger(f"Falling back to brute force for {search_term}...")
     res = brute_force_search(path_0000, search_term)
     if res:
-        logger(f"Found {search_term} by brute_force.")
+        logger(f"Found {search_term} by brute_force -> {res['path']}")
     else:
         logger(f"Could not find {search_term}.")
     return res
 
-def multi_search(path_0000: Path, search_terms: List[str], expected_info: Optional[List[Tuple[str,int]]] = None, logger=print):
-    """
-    Multi-search helper. If expected_info is None, attempts to load step_1_config.txt
-    from the repository root and use that to accelerate searches.
-
-    expected_info is a list of tuples (expected_filename, expected_size) corresponding
-    to the search_terms list. If an entry is missing, blank/defaults will be used.
-
-    Returns list of result dicts (or None) in the same order as search_terms.
-    """
-    path_0000 = Path(path_0000)
-    # If expected_info not provided, try to read from a config file near project root.
-    if expected_info is None:
-        try:
-            # step_1_config.txt is typically located next to the scripts (project root in this repo)
-            repo_root = Path(__file__).resolve().parents[1]
-            cfg_path = repo_root / "step_1_config.txt"
-            if cfg_path.is_file():
-                cfg_triples = load_search_triples_from_config(cfg_path)
-                # Build a mapping from search_term -> (expected_filename, expected_size)
-                cfg_map = {t[0]: (t[1], t[2]) for t in cfg_triples}
-                expected_info = []
-                for term in search_terms:
-                    if term in cfg_map:
-                        expected_info.append(cfg_map[term])
-                    else:
-                        expected_info.append(("", 0))
-            else:
-                expected_info = [("", 0)] * len(search_terms)
-        except Exception:
-            expected_info = [("", 0)] * len(search_terms)
-
-    # Now run searches using the expected_info entries
-    ans = [None for _ in search_terms]
-    for i, term in enumerate(search_terms):
-        expected_filename, expected_size = ("", 0)
-        if expected_info and i < len(expected_info):
-            expected_filename, expected_size = expected_info[i]
-        ans[i] = search(path_0000, term, expected_filename, expected_size, logger=logger)
-    for file_path in ans:
-        logger(f"Found {file_path}")
-    return ans
-
 def load_search_triples_from_config(config_path: Path) -> List[Tuple[str,str,int]]:
     """
     Parse a step_1_config.txt file that looks like:
-
-    ### Put the path to YOUR 0000 folder in the below line
-    C:\...\0000
-    ### Names of assets of interest ...
-    CARD_Desc 21ae1efa 725225
-    CARD_Indx 507764bc 61824
-    ...
-
+      <path_to_0000>
+      CARD_Desc 21ae1efa 725225
+      ...
     Returns list of triples (search_term, expected_filename, expected_size)
     """
     config_path = Path(config_path)
@@ -168,19 +126,62 @@ def load_search_triples_from_config(config_path: Path) -> List[Tuple[str,str,int
             if not s or s.startswith("###"):
                 continue
             lines.append(s)
-    # first non-comment line is path_0000; skip it
     if not lines:
         return []
-    # lines[0] is path_0000; parse subsequent lines
     triples = []
     for line in lines[1:]:
         parts = line.split()
-        if len(parts) >= 3:
+        if len(parts) >= 2:
             search_term = parts[0]
             expected_filename = parts[1]
-            try:
-                expected_size = int(parts[2])
-            except Exception:
-                expected_size = 0
+            expected_size = 0
+            if len(parts) >= 3:
+                try:
+                    expected_size = int(parts[2])
+                except Exception:
+                    expected_size = 0
             triples.append((search_term, expected_filename, expected_size))
     return triples
+
+def multi_search(path_0000: Path, search_terms: List[str], expected_info: Optional[List[Tuple[str,int]]] = None, logger=print):
+    """
+    Multi-search helper. Uses the following priority to determine expected filename:
+    1) explicit expected_info argument (if provided by caller)
+    2) step_1_config.txt located at repo root
+    3) DEFAULT_SEARCH_TRIPLES hard-coded mapping (fast path based on your data)
+    4) fallback to empty expected filename (slow)
+
+    Returns list of result dicts (or None) in the same order as search_terms.
+    """
+    path_0000 = Path(path_0000)
+
+    if expected_info is None:
+        # attempt to load config near repo root
+        try:
+            repo_root = Path(__file__).resolve().parents[1]
+            cfg_path = repo_root / "step_1_config.txt"
+            if cfg_path.is_file():
+                cfg_triples = load_search_triples_from_config(cfg_path)
+            else:
+                cfg_triples = []
+        except Exception:
+            cfg_triples = []
+
+        # build mapping from cfg_triples or default triples
+        mapping = {t[0]: (t[1], t[2]) for t in cfg_triples} if cfg_triples else {t[0]: (t[1], t[2]) for t in DEFAULT_SEARCH_TRIPLES}
+        expected_info = []
+        for term in search_terms:
+            if term in mapping:
+                expected_info.append(mapping[term])
+            else:
+                expected_info.append(("", 0))
+
+    ans = [None for _ in search_terms]
+    for i, term in enumerate(search_terms):
+        expected_filename, expected_size = ("", 0)
+        if expected_info and i < len(expected_info):
+            expected_filename, expected_size = expected_info[i]
+        ans[i] = search(path_0000, term, expected_filename, expected_size, logger=logger)
+    for file_path in ans:
+        logger(f"Search result: {file_path}")
+    return ans
