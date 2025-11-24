@@ -1,11 +1,21 @@
 """
 Updated GUI main window:
+- Ensures project root is on sys.path so `import common_defs` always works.
 - Loads/creates braced DESC view using Card_Pidx/Card_Part if necessary.
 - Save writes !Changed !Braced ... and !Unbraced !Changed ... and !Changed Card_Part.bytes.dec
 - Keeps in-memory arrays updated so Save persists when switching cards.
 - Copies found Unity asset container files into common_defs.copied_files_folder/0000/... for compatibility with step_4 script.
 - Build button will run step_4_mod_the_files.py (single-click) to produce the modded 0000 folder (uses original scripts).
 """
+import sys
+from pathlib import Path
+
+# Ensure project root is on sys.path so top-level modules (common_defs, step_*.py, etc.) are importable
+ROOT = Path(__file__).resolve().parents[1]
+ROOT_STR = str(ROOT)
+if ROOT_STR not in sys.path:
+    sys.path.insert(0, ROOT_STR)
+
 import os
 import threading
 import json
@@ -15,6 +25,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import shutil
 import subprocess
+
 import common_defs
 
 from gui.theme import apply_theme
