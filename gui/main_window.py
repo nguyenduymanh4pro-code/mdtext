@@ -1,4 +1,3 @@
-```url=https://github.com/nguyenduymanh4pro-code/mdtext/blob/main/gui/main_window.py
 """
 Updated GUI main window:
 - Loads/creates braced DESC view using Card_Pidx/Card_Part if necessary.
@@ -430,4 +429,3 @@ class MainWindow(ttk.Frame):
                     fp = Path(root) / f
                     z.write(fp, fp.relative_to(base))
         messagebox.showinfo("Exported", f"Exported ZIP to {out}")
-```
