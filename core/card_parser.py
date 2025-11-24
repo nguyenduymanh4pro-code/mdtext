@@ -1,113 +1,159 @@
-"""
-CARD_* parsing and merging helpers.
-
-Provides:
-- load_names(path_to_CARD_Name.bytes.dec.json) -> list[str]
-- load_descs(path_to_CARD_Desc.bytes.dec.json) -> list[str]
-- build_and_encrypt(...) -> merges names+descs into bytes and encrypts them using decryptor key/algorithm
+"""core/card_parser.py
+Helpers for card name/desc loading, producing braced descriptions from part tables,
+saving changed braced/unbraced JSONs and producing changed Card_Part bytes
+(similar logic to the community tool's step_3 routines).
 """
 from pathlib import Path
+from typing import List
 import json
-from core import decryptor
-from typing import Union
-import struct
-import os
+from core import part_parser, utils
 
-def load_names(path: Union[str, Path]):
+nul = b'\x00'
+
+def load_names(path: Path) -> List[str]:
     path = Path(path)
     with open(path, encoding="utf-8") as f:
-        arr = json.load(f)
-    return arr
+        return json.load(f)
 
-def load_descs(path: Union[str, Path]):
+def load_descs(path: Path) -> List[str]:
     path = Path(path)
     with open(path, encoding="utf-8") as f:
-        arr = json.load(f)
-    return arr
+        return json.load(f)
 
-def get_string_len_utf8(s: str):
-    return len(s.encode("utf-8"))
+# --- Braces utilities (port of common_defs.insert_braces / unbraced logic) ---
+def string_insert(orig_bytes: bytes, insert_bytes: bytes, index: int) -> bytes:
+    return orig_bytes[:index] + insert_bytes + orig_bytes[index:]
 
-def _pack_index_list(ints):
-    # Write little-endian 4-byte values for each int
-    b = bytearray()
-    for v in ints:
-        b.extend((v & 0xFF).to_bytes(1, "little"))
-        b.extend(((v >> 8) & 0xFF).to_bytes(1, "little"))
-        b.extend(((v >> 16) & 0xFF).to_bytes(1, "little"))
-        b.extend(((v >> 24) & 0xFF).to_bytes(1, "little"))
-    return bytes(b)
+def insert_braces(effect_text: str, parts_arr: List[tuple]) -> str:
+    # filter invalid
+    parts_arr = [(a, b) for (a, b) in parts_arr if a < b]
 
-def build_and_encrypt(CARD_Name_json: Path, CARD_Desc_json: Path, CARD_Indx_template: Path, out_folder: Path, logger=print):
-    """
-    Merge name/desc JSONs back to the binary format and encrypt them using the same crypto key
-    as the existing CARD_Indx_template (if a key exists; otherwise tries brute-forcing from template).
-    The CARD_Indx_template is used to get index structure and the !CryptoKey.txt if present.
-    """
-    out_folder = Path(out_folder)
-    out_folder.mkdir(parents=True, exist_ok=True)
+    L, R = '{', '}'
+    insertion_dict = {}
+    for (a, b) in parts_arr:
+        if a not in insertion_dict:
+            insertion_dict[a] = {L: 0, R: 0}
+        if (b + 1) not in insertion_dict:
+            insertion_dict[b + 1] = {L: 0, R: 0}
+        insertion_dict[a][L] += 1
+        insertion_dict[b + 1][R] += 1
 
-    names = load_names(CARD_Name_json)
-    descs = load_descs(CARD_Desc_json)
+    ans = effect_text.encode()
+    indices_list = sorted(list(insertion_dict.keys()), reverse=True)
+    for index in indices_list:
+        inserted_braces = insertion_dict[index][R] * b'}' + insertion_dict[index][L] * b'{'
+        ans = string_insert(ans, inserted_braces, index)
+    return ans.decode()
 
-    # Build merged strings with 8 NUL bytes prefix (community tool used \x00*8 start)
-    name_merge = "\x00" * 8
-    desc_merge = "\x00" * 8
-    name_indx = [0]
-    desc_indx = [0]
+# Build braced descriptions from unbraced descs + part table
+def build_braced_descs(descs: List[str], pidx_dec_path: Path, part_dec_path: Path) -> List[str]:
+    # load pidx and part table via part_parser
+    pidx_table = part_parser.get_pidx_table(Path(pidx_dec_path))
+    part_table = part_parser.get_part_table(Path(part_dec_path), pidx_table)
+    braced = []
+    for i in range(len(descs)):
+        part_arr = part_table[i] if i < len(part_table) else []
+        braced.append(insert_braces(descs[i], part_arr))
+    return braced
 
-    def helper(sentence, indx_list, merge_buf):
-        length = get_string_len_utf8(sentence)
-        if len(indx_list) == 1:
-            length += 8
-        space_len = (4 - (length % 4)) % 4
-        indx_list.append(indx_list[-1] + length + space_len)
-        return sentence + ("\x00" * space_len)
+# Save braced changed file into changed folder (mimic community naming)
+def save_changed_braced(changed_folder: Path, braced_descs: List[str]):
+    changed_folder.mkdir(parents=True, exist_ok=True)
+    out = Path(changed_folder) / "!Changed !Braced CARD_Desc.bytes.dec.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(braced_descs, f, ensure_ascii=False, indent=2)
+    return out
 
-    for i in range(max(len(names), len(descs))):
-        n = names[i] if i < len(names) else ""
-        d = descs[i] if i < len(descs) else ""
-        name_merge += helper(n, name_indx, name_merge)
-        desc_merge += helper(d, desc_indx, desc_merge)
+def make_unbraced_from_braced(braced_descs: List[str]) -> List[str]:
+    return [s.replace('{', '').replace('}', '') for s in braced_descs]
 
-    # prefix indexes as community script did
-    name_indx = [4, 8] + name_indx[1:]
-    desc_indx = [4, 8] + desc_indx[1:]
+def save_unbraced_changed(changed_folder: Path, unbraced_descs: List[str]):
+    changed_folder.mkdir(parents=True, exist_ok=True)
+    out = Path(changed_folder) / "!Unbraced !Changed CARD_Desc.bytes.dec.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(unbraced_descs, f, ensure_ascii=False, indent=2)
+    return out
 
-    # Compose card_indx interleaved
-    card_indx = []
-    for a, b in zip(name_indx, desc_indx):
-        card_indx.append(a)
-        card_indx.append(b)
+# --- PART table adjustment (port of step_3 logic) ---
+def concated_pairs(pairs_list: List[tuple]) -> List[int]:
+    ans = []
+    for a, b in pairs_list:
+        if a == b:
+            continue
+        ans.extend([a, b])
+    ans.sort()
+    return ans
 
-    # Build binary representation
-    # card_indx becomes list of little-endian 4-bytes numbers
-    indx_binary = bytearray()
-    for num in card_indx:
-        indx_binary.extend(int.to_bytes(num, 4, "little"))
+def get_diff(arr_old: List[int], arr_new: List[int]):
+    if arr_old == arr_new:
+        return None
+    # create differences; align lengths
+    L = max(len(arr_old), len(arr_new))
+    dif = []
+    for i in range(L):
+        a = arr_old[i] if i < len(arr_old) else 0
+        b = arr_new[i] if i < len(arr_new) else 0
+        dif.append(a - b)
+    return dif
 
-    # Now find crypto key: check template folder for !CryptoKey.txt
-    template_folder = CARD_Indx_template.parent
-    key = decryptor.get_crypto_key_from_file(template_folder)
-    if key is None:
-        # try brute forcing using template file if provided
-        try:
-            key = decryptor.find_crypto_key_for_file(CARD_Indx_template)
-        except Exception:
-            key = 0
+def make_map(i: int, part_table: List[List[tuple]], braced_descs: List[str], changed_braced_descs: List[str]):
+    unbraced_arr = concated_pairs(part_table[i])
+    braced_arr = part_parser.unbraced_brace_indices(braced_descs[i])
+    arr_dif = None
+    try:
+        arr_dif = get_diff(unbraced_arr, braced_arr)
+    except Exception:
+        arr_dif = None
+    changed_braced_arr = part_parser.unbraced_brace_indices(changed_braced_descs[i])
+    ans = {}
+    if arr_dif:
+        for j in range(max(len(arr_dif), len(changed_braced_arr))):
+            if j < len(changed_braced_arr):
+                changed_braced_arr[j] += arr_dif[j] if j < len(arr_dif) else 0
+    for j in range(max(len(unbraced_arr), len(changed_braced_arr))):
+        a = unbraced_arr[j] if j < len(unbraced_arr) else 0
+        b = changed_braced_arr[j] if j < len(changed_braced_arr) else 0
+        ans[a] = b
+    return ans
 
-    # Encrypt payloads
-    name_bytes = name_merge.encode("utf-8")
-    desc_bytes = desc_merge.encode("utf-8")
-    card_indx_bytes = bytes(indx_binary)
+def apply_map(part_arr: List[tuple], part_map: dict):
+    ans = []
+    f = part_map
+    for (a, b) in part_arr:
+        if a >= b:
+            ans.append((a, b))
+            continue
+        if a in f and b in f:
+            ans.append((f[a], f[b]))
+        else:
+            ans.append((a, b))
+    return ans
 
-    enc_name = decryptor.encrypt_bytes(name_bytes, key)
-    enc_desc = decryptor.encrypt_bytes(desc_bytes, key)
-    enc_indx = decryptor.encrypt_bytes(card_indx_bytes, key)
+def adjust_part_table(part_table: List[List[tuple]], braced_descs: List[str], changed_braced_descs: List[str]) -> List[List[tuple]]:
+    new_table = [list(arr) for arr in part_table]
+    for i in range(len(part_table)):
+        part_map = make_map(i, part_table, braced_descs, changed_braced_descs)
+        new_table[i] = apply_map(part_table[i], part_map)
+    return new_table
 
-    # Write to out_folder with same names (these are .bytes files ready to be placed into the bundle)
-    (out_folder / "CARD_Name.bytes").write_bytes(enc_name)
-    (out_folder / "CARD_Desc.bytes").write_bytes(enc_desc)
-    (out_folder / "CARD_Indx.bytes").write_bytes(enc_indx)
+def write_part_file(part_file_path: Path, part_table: List[List[tuple]]):
+    part_file_path.parent.mkdir(parents=True, exist_ok=True)
+    indices = [None for _ in part_table]
+    with open(part_file_path, "wb") as f:
+        f.write(4 * nul)
+        index = 1
+        for j, changed_part_arr in enumerate(part_table):
+            indices[j] = index
+            for part in changed_part_arr:
+                a, b = part
+                f.write(a.to_bytes(2, "little"))
+                f.write(b.to_bytes(2, "little"))
+                index += 1
+    return indices
 
-    logger(f"Wrote encrypted CARD_Name.bytes, CARD_Desc.bytes, CARD_Indx.bytes to {out_folder}")
+def make_changed_part_file(changed_part_path: Path, pidx_dec_path: Path, part_dec_path: Path, braced_descs: List[str], changed_braced_descs: List[str]):
+    pidx_table = part_parser.get_pidx_table(Path(pidx_dec_path))
+    part_table = part_parser.get_part_table(Path(part_dec_path), pidx_table)
+    adjusted = adjust_part_table(part_table, braced_descs, changed_braced_descs)
+    write_part_file(Path(changed_part_path), adjusted)
+    return Path(changed_part_path)
